@@ -1,0 +1,3 @@
+# Baggage reconciliation contract
+
+Input has `flights`, `bags`, and `scans`. IDs are unique. Scan event order is `(event_time, scan_id)`; a scan for an unknown bag is rejected. Each bag's final scan determines current station. A bag is `not_seen` when it has no scans, `arrived` when its final station equals the flight destination, otherwise `in_transit`. A connection is at risk when the bag's latest station is the connecting airport and the next departure is earlier than `event_time + minimum_connection_minutes`. Times are ISO-8601 with explicit offsets. This tool reports operational evidence; it does not infer physical location or dispatch staff.
