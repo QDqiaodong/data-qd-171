@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import archive, handoff, loading
+from . import archive, fees, handoff, loading
 from .core import reconcile
 
 
@@ -27,6 +27,13 @@ HANDOFF_COMMANDS = (
     "handoff-import",
     "handoff-ack",
     "handoff-view",
+)
+FEE_COMMANDS = (
+    "fee-init",
+    "fee-preview",
+    "fee-close",
+    "fee-correct",
+    "fee-show",
 )
 
 
@@ -138,6 +145,34 @@ def _main_handoff(command, argv):
     print(json.dumps(result, sort_keys=True))
 
 
+def _main_fee(command, argv):
+    parser = argparse.ArgumentParser(prog=f"bag-reconcile {command}")
+    parser.add_argument("--archive", required=True)
+    if command == "fee-init":
+        parser.add_argument("--rates", required=True)
+        args = parser.parse_args(argv)
+        result = fees.init_ledger(args.archive, args.rates)
+    elif command == "fee-preview":
+        parser.add_argument("--month", required=True)
+        parser.add_argument("--as-of", required=True, type=int)
+        args = parser.parse_args(argv)
+        result = fees.preview_month(args.archive, args.month, args.as_of)
+    elif command == "fee-close":
+        parser.add_argument("--month", required=True)
+        parser.add_argument("--as-of", required=True, type=int)
+        args = parser.parse_args(argv)
+        result = fees.close_month(args.archive, args.month, args.as_of)
+    elif command == "fee-correct":
+        parser.add_argument("--as-of", required=True, type=int)
+        args = parser.parse_args(argv)
+        result = fees.correct_ledger(args.archive, args.as_of)
+    else:
+        parser.add_argument("--month", required=True)
+        args = parser.parse_args(argv)
+        result = fees.show_month(args.archive, args.month)
+    print(json.dumps(result, sort_keys=True))
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -150,6 +185,8 @@ def main(argv=None):
             _main_loading(command, argv[1:])
         elif command in HANDOFF_COMMANDS:
             _main_handoff(command, argv[1:])
+        elif command in FEE_COMMANDS:
+            _main_fee(command, argv[1:])
         else:
             _main_legacy(argv)
     except (OSError, ValueError, KeyError, TypeError) as exc:

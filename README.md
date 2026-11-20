@@ -93,3 +93,42 @@ a receipt that exactly matches a sent packet. State is written atomically, so
 every side can be closed and relaunched without losing a pending packet, an
 applied copy, or a receipt. See `docs/contract.md` for the file formats,
 validation order, and restart recovery steps.
+
+## Local monthly evidence-fee settlement
+
+Monthly settlement records a fixed evidence service fee per transfer service
+whose documentary record satisfies the contract, and issues immutable monthly
+statements that later corrections adjust without rewriting. It lives inside an
+existing archive, never modifies `events.jsonl`, and needs no rebuild. Amounts
+record evidence only: they never prove a physical transfer and never affect
+screening, loading, or handoff.
+
+```sh
+bag-reconcile fee-init    --archive ARCHIVE --rates RATES
+bag-reconcile fee-preview --archive ARCHIVE --month YYYY-MM --as-of SEQ
+bag-reconcile fee-close   --archive ARCHIVE --month YYYY-MM --as-of SEQ
+bag-reconcile fee-correct --archive ARCHIVE --as-of SEQ
+bag-reconcile fee-show    --archive ARCHIVE --month YYYY-MM
+```
+
+- `fee-init` stores a strict station→positive-integer-cents rate table and an
+  empty ledger; it refuses an archive that already has one.
+- `fee-preview` is read-only: it lists every candidate for the month at the
+  cutoff (billable or not) with reasons, both flight source versions, the
+  adopted scan and its version, and per-station billable counts and amounts. It
+  may use any accepted cutoff, including one older than the last posted one.
+- `fee-close` first-closes one month (all stations, even if empty) and, in the
+  same atomic step, registers any corrections now due to older closed months.
+  Corrections are never skipped because the new month has no fees.
+- `fee-correct` rechecks all closed months at a cutoff and posts only real
+  financial changes; repeating a cutoff adds nothing.
+- `fee-show` prints a closed month's immutable original statement, its
+  correction lines (with the charges they reverse), and the per-station balance.
+
+A service whose attribution (station/month) or billability actually changes is
+reversed at its old station/month and, only if the new month is already closed,
+charged again with a fresh positive line. Evidence-version changes that keep the
+same station, month, and amount add nothing. Write cutoffs must be accepted and
+never older than the last processed one. The ledger is written atomically and
+re-read on every command, so a failed or interrupted run posts nothing and can
+be retried exactly once. See `docs/contract.md` for the full rules.

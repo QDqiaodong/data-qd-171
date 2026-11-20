@@ -458,3 +458,242 @@ program loses nothing.
 All six commands exit with status 2 and print `bag-reconcile: <message>` on
 validation, JSON, duplicate-key, or filesystem errors. No command contacts an
 external service; everything uses the standard library.
+
+## Local monthly evidence-fee settlement
+
+Monthly settlement records a fixed **evidence service fee** for each transfer
+service whose documentary record satisfies the contract below. The amount is
+accounting for the record only: it never proves that a bag was physically
+transferred, and it never changes screening, loading, handoff, or the existing
+single-shot/archive query behaviour. Everything is local, standard-library
+only, and no command contacts an external service, pays anything, or implements
+concurrent settlement.
+
+The ledger is one JSON document, `<archive>/fee-ledger.json`, beside the
+untouched `events.jsonl`. It is created by `fee-init` and replaced atomically
+(temp file, fsync, `os.replace`). Every fee command re-reads it from disk, and
+all fee commands take the same archive-wide advisory lock as `archive-apply`,
+so a settlement read never mixes with an archive write. `events.jsonl` is never
+modified, no archive rebuild or migration is needed, and the existing archive,
+loading and handoff commands are unchanged.
+
+### Rate table and `fee-init`
+
+`fee-init --archive ARCHIVE --rates FILE` registers the archive's rate table and
+an empty monthly ledger. `FILE` must be a strict JSON object keyed by station
+code (non-empty strings) whose values are positive integer amounts in a single
+currency unit (cents); duplicate keys, arrays, zero/negative, boolean, float, or
+string values are rejected, and nothing is created. The table is fixed for the
+archive's lifetime; there is no rate versioning. `fee-init` refuses an archive
+that already has a ledger.
+
+### Services, attribution, and billability
+
+A **service** is a bag that has a non-empty `next_flight_id`. Its stable
+identity is `(bag_id, next_flight_id)`; its prior leg is the bag's fixed
+`flight_id`. At the requested `knowledge_seq`, using the flight and scan
+versions effective at that cutoff:
+
+- the **attribution station** is the next flight's `origin` (departure
+  station);
+- the **attribution month** is the UTC calendar month of the next flight's
+  scheduled `departure` instant. Times are compared as offset-aware instants,
+  never by wall-clock strings, the machine time zone, scan insertion order, or
+  a scan at another station. A departure that is already next month locally but
+  still this month in UTC stays in the UTC month.
+
+A service is **billable** only when every condition holds:
+
+1. prior and next flights are different (`same_leg` otherwise);
+2. the prior flight's `destination` equals the next flight's `origin`
+   (`prior_arrival_station_mismatch` otherwise);
+3. the prior flight's `arrival` is not later than the next flight's
+   `departure` (`prior_arrival_after_next_departure` otherwise);
+4. the attribution station has a rate (`no_rate_for_station` otherwise);
+5. the bag's `minimum_connection_minutes` is a non-negative integer
+   (`invalid_minimum_connection_minutes` otherwise — negatives and non-integers
+   are not billable);
+6. the **evidence window** is non-empty: from the prior flight's scheduled
+   `arrival` up to and including the next flight's scheduled `departure` minus
+   `minimum_connection_minutes` (`empty_evidence_window` otherwise);
+7. at least one scan of that bag whose `station` equals the attribution station
+   has an `event_time` inside the inclusive window (`no_station_evidence`
+   otherwise).
+
+Among qualifying scans, the **adopted scan** is the one with the earliest
+`event_time`; ties break by `scan_id` in lexicographic order. All scan versions
+and both flight versions must come from the same requested cutoff. The existing
+`connection_at_risk` flag and the latest scan are never used to decide a fee.
+
+### `fee-preview --archive ARCHIVE --month YYYY-MM --as-of SEQ`
+
+Read-only. Recomputes the month at the cutoff and prints every **candidate** —
+a service whose attribution month equals `--month`, whether or not it is
+billable — with:
+
+- `bag_id`, `next_flight_id`, `prior_flight_id`, `station`, `month`;
+- `billable`, the sorted `reasons` list (empty when billable), and
+  `amount_cents` (`null` when not billable);
+- `rate_cents`, `minimum_connection_minutes`, `window_start`, `window_end`;
+- `adopted_scan` with its `scan_id`, `station`, `event_time`, source
+  `knowledge_seq` and `batch_id`, plus all `qualifying_scan_ids`;
+- `prior_flight` and `next_flight` with both source versions (`knowledge_seq`,
+  `batch_id`). Initial versions report `batch_id: null`.
+
+Candidates are ordered by `(bag_id, next_flight_id)`, and `summary` gives
+`candidate_count`, `billable_count`, `non_billable_count`, `amount_cents`, and
+`by_station` rows (sorted by station) with billable count and amount. The result
+is marked `recomputation: true` and `accounting_effect: "none"`; it is a fresh
+recalculation, not the outstanding balance of an issued statement. Preview
+accepts any already-accepted `knowledge_seq`, including one older than the last
+processed cutoff, and never changes the ledger.
+
+### `fee-close --archive ARCHIVE --month YYYY-MM --as-of SEQ`
+
+First-closes one month, all stations together. A month may be first-closed only
+once; re-running it is refused and never re-signs the original. A month with no
+billable service is still registered as closed (`total_amount_cents` 0). Months
+may be closed out of order and at the same cutoff.
+
+In one atomic operation the command:
+
+1. appends any **corrections** now due to *already-closed* months (the same
+   logic as `fee-correct`, described below);
+2. records the first-close statement for `--month` from the services currently
+   billable with that attribution month, saving each line's amount, station and
+   month, service identity, and basis (both flight versions, the adopted scan
+   and its version, the window, and the rate). Statement lines and the total are
+   immutable.
+
+Old-month corrections are registered even when the new month has no fees and
+even when they would otherwise need `fee-correct`; nothing is skipped. The
+write operations require an accepted integer `knowledge_seq` that is not
+smaller than the ledger's last successfully processed cutoff; the same cutoff
+may close several different months.
+
+### `fee-correct --archive ARCHIVE --as-of SEQ`
+
+Rechecks **all closed months** at the cutoff and registers the corrections that
+are due; it never creates a new monthly statement. It is refused when no month
+has been closed yet. The cutoff must be accepted and not older than the last
+processed cutoff. Re-running the same cutoff produces no new ledger lines but
+is still accepted; a new cutoff with no financial change adds no lines yet
+records that the ledger has rechecked through that cutoff.
+
+### Correction rules
+
+Only actual financial changes produce lines. For one service, comparing its
+single **effective charge** (its currently un-reversed positive line) with the
+new evaluation:
+
+- If it is still attributed to the same station and month with the same amount,
+  nothing is recorded — even when the adopted scan or either flight version
+  changed. Preview still shows the new evidence.
+- If it is no longer attributed there (station or month changed, or it is no
+  longer billable), the effective charge is **reversed** by a negative line of
+  exactly the original positive amount. The reversal keeps the original
+  station/month, names the reversed `line_id` and amount, and records an
+  auditable reason (`reattributed` with the new station/month, `not_billable`
+  with the unmet reasons, or `amount_changed`) plus the current basis.
+- If it should now be recorded in an **already-closed** month that has no
+  effective charge, a new positive line is added with the new evidence. This
+  covers a first reattribution into a closed month, late evidence making a
+  closed month newly billable (`supplemental`), and a service returning after a
+  reversal (`returned` — always a new positive line that never cancels the old
+  reversal or points at a reversed line).
+- If it should be recorded in a month that is **not yet closed**, only the
+  reversal is registered; the positive line appears when that month is
+  first-closed.
+
+When a reattribution touches a month that is already closed, both the reversal
+and the new positive line land in the same atomic operation. There is never a
+half-applied cross-month adjustment, a truncated statement, or an advanced
+cutoff: the whole new ledger is built in memory and written once.
+
+Every charge and correction line carries the `knowledge_seq` cutoff of the
+operation that produced it. Reversing and re-adding show the reason and the
+basis that motivated each move, so a reversal can be audited even though the
+original statement is untouched.
+
+### `fee-show --archive ARCHIVE --month YYYY-MM`
+
+Shows one **closed** month; unknown or unclosed months are refused. It prints:
+
+- `original_statement` — the immutable first-close lines with amount, station,
+  month, service identity and basis, and its total;
+- `corrections` — every correction batch that touched this month, with its
+  cutoff and lines; a reversal line also shows the `reversed_charge` it
+  cancelled (line id, station, month, amount, reason);
+- `balance` — `original_amount_cents`, `corrections_amount_cents`, the summed
+  `amount_cents`, and `by_station` rows carrying the original, corrections and
+  balance amount per station. The balance always equals the original statement
+  plus every correction line for that station and month.
+
+`fee-show` only reads stored ledger state plus the archive's existence; it never
+recomputes from current evidence, so new archive batches do not silently change
+an issued month.
+
+### Ordering, idempotency, and recovery
+
+- Candidates/statement lines are ordered by `(bag_id, next_flight_id)`; station
+  summaries by station; correction lines by the order the planner emits them
+  (deterministic).
+- Line ids are monotonic across the whole ledger (`L00000001`, …) and are never
+  reused. Charges and reversals form a consistent chain: at most one effective
+  charge per service, and each reversal must match the current effective charge.
+- Repeating a correction at an unchanged cutoff adds no lines. A newer cutoff
+  with no change still advances the remembered cutoff.
+- A failed or interrupted write leaves the previously accepted ledger
+  byte-for-byte readable; the command can be retried and posts each due line
+  exactly once. Because every command re-reads `<archive>/fee-ledger.json`, a
+  fresh process continues exactly where the last successful one stopped.
+- Commands are serialised by the archive-wide advisory lock, which holds across
+  processes and is released by the kernel if a process dies.
+
+### Errors
+
+All five fee commands exit with status 2 and print `bag-reconcile: <message>`
+on validation, JSON, duplicate-key, or filesystem errors, matching the existing
+CLI convention. Successful commands print a single readable JSON object.
+
+### Worked acceptance sequence
+
+F1 `AAA→BBB` arrives 2026-01-01T10:00Z; F2 `BBB→CCC` departs
+2026-02-01T08:00+09:00 (= 2026-01-31T23:00Z); bag B has a 60-minute minimum.
+Rates are `{"BBB": 1000, "CCC": 2000}`. B has a BBB scan at exactly the window
+end (2026-01-31T22:00Z), so the service is billable at BBB in UTC month
+2026-01 even though its local wall clock is February.
+
+1. `fee-close --month 2026-01 --as-of 1` records BBB / 2026-01 / 1000 cents.
+2. Archive batches revise F1 to `AAA→CCC`, F2 to depart CCC in February, and add
+   a CCC scan; this makes the service billable at CCC in 2026-02.
+3. With 2026-02 still open, `fee-correct` (or `fee-close --month 2026-02`, or
+   any other first-close) reverses the January BBB line. A subsequent
+   `fee-close --month 2026-02` records the CCC / 2026-02 / 2000-cent line once.
+   When 2026-02 was already closed beforehand, the same correction registers
+   the reversal and the new charge together in one operation.
+4. Retracting the qualifying scan reverses the effective charge without
+   rewriting the first-close statement; re-running the same cutoff adds nothing.
+5. An older cutoff may still `fee-preview` but cannot `fee-correct`/`fee-close`.
+6. Killing a write leaves no partial state; retrying — even in a new process —
+   posts once and subsequent runs add nothing.
+
+### Continuing after a restart
+
+The ledger is the only durable fee state and it is read fresh on every command,
+so an operator continues with the next command after a crash or reboot:
+
+1. `fee-preview --month M --as-of SEQ` to recompute and inspect the candidates
+   and their reasons at the cutoff (safe at any accepted cutoff).
+2. If a month needs first close, run `fee-close --month M --as-of SEQ`. If it
+   was already closed, the command is refused — the original stays authoritative;
+   use `fee-correct` instead.
+3. `fee-correct --as-of SEQ` to settle corrections to all closed months without
+   opening a new one.
+4. `fee-show --month M` to read a closed month's original statement, correction
+   lines, and balance.
+
+A retried write after an ambiguous failure either has already advanced the
+ledger (then it is a no-op at the same cutoff) or had not written at all (then it
+posts the same lines once). Neither case double-charges, and no step ever
+requires editing `events.jsonl`.
