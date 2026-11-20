@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import archive, loading
+from . import archive, handoff, loading
 from .core import reconcile
 
 
@@ -19,6 +19,14 @@ LOADING_COMMANDS = (
     "loading-commit",
     "loading-cancel",
     "loading-status",
+)
+HANDOFF_COMMANDS = (
+    "handoff-open",
+    "handoff-export",
+    "handoff-inbox",
+    "handoff-import",
+    "handoff-ack",
+    "handoff-view",
 )
 
 
@@ -89,6 +97,47 @@ def _main_loading(command, argv):
     print(json.dumps(result, sort_keys=True))
 
 
+def _main_handoff(command, argv):
+    parser = argparse.ArgumentParser(prog=f"bag-reconcile {command}")
+    if command == "handoff-open":
+        parser.add_argument("--archive", required=True)
+        parser.add_argument("--stream", required=True)
+        parser.add_argument("--desk", required=True)
+        args = parser.parse_args(argv)
+        result = handoff.open_stream(args.archive, args.stream, args.desk)
+    elif command == "handoff-export":
+        parser.add_argument("--archive", required=True)
+        parser.add_argument("--stream", required=True)
+        parser.add_argument("--as-of", required=True, type=int)
+        parser.add_argument("--output", required=True)
+        args = parser.parse_args(argv)
+        result = handoff.export_packet(
+            args.archive, args.stream, args.as_of, args.output
+        )
+    elif command == "handoff-inbox":
+        parser.add_argument("--inbox", required=True)
+        parser.add_argument("--stream", required=True)
+        parser.add_argument("--desk", required=True)
+        args = parser.parse_args(argv)
+        result = handoff.create_inbox(args.inbox, args.stream, args.desk)
+    elif command == "handoff-import":
+        parser.add_argument("--inbox", required=True)
+        parser.add_argument("--packet", required=True)
+        args = parser.parse_args(argv)
+        result = handoff.import_packet(args.inbox, args.packet)
+    elif command == "handoff-ack":
+        parser.add_argument("--archive", required=True)
+        parser.add_argument("--stream", required=True)
+        parser.add_argument("--receipt", required=True)
+        args = parser.parse_args(argv)
+        result = handoff.acknowledge(args.archive, args.stream, args.receipt)
+    else:
+        parser.add_argument("--inbox", required=True)
+        args = parser.parse_args(argv)
+        result = handoff.view_inbox(args.inbox)
+    print(json.dumps(result, sort_keys=True))
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -99,6 +148,8 @@ def main(argv=None):
             _main_archive(command, argv[1:])
         elif command in LOADING_COMMANDS:
             _main_loading(command, argv[1:])
+        elif command in HANDOFF_COMMANDS:
+            _main_handoff(command, argv[1:])
         else:
             _main_legacy(argv)
     except (OSError, ValueError, KeyError, TypeError) as exc:

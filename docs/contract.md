@@ -269,3 +269,192 @@ changed sources and still-occupying manifest IDs.
 Workbench commands exit with status 2 and print `bag-reconcile: <message>` on
 validation, JSON, duplicate-key, or filesystem errors. All constraints hold
 across process restarts; state is read from disk on every command.
+
+## Offline per-desk evidence handoff
+
+Handoff moves one desk's operational evidence from a sender that owns an
+archive to a receiver that never reads it. The two sides exchange ordinary
+JSON files by any manual means (e-mail, removable media, copy); nothing here
+signs, contacts a network, or authenticates the operator. A packet is a
+self-contained description of **which evidence the desk is responsible for
+viewing** — it never asserts that a bag is physically present, never triggers
+dispatch or loading, and never carries screening records or load manifests.
+
+### Streams and scope
+
+A delivery stream is identified by a sender-chosen, unique `stream_id` and a
+fixed station code `desk`. The same archive may host several independent
+streams; each advances on its own. A registered `stream_id` can never change
+station or be reused, and a receiver inbox carries exactly one stream.
+
+At a given archive cutoff the desk's scope is decided by the **effective flight
+plan**. A bag is in scope only when it has a non-empty `next_flight_id` whose
+flight `origin` equals the desk. Every in-scope bag contributes one row keyed by
+`bag_id` that carries:
+
+- the bag's `next_flight_id`;
+- that flight's `origin`, `destination`, `departure`, `arrival`, and the
+  flight version's source `knowledge_seq` (`flight_knowledge_seq`);
+- the bag's latest **active scan at this desk**, ordered by the real
+  offset-aware `event_time` and then `scan_id`, with its `scan_id`,
+  `event_time`, and source `knowledge_seq` — or `null` when the bag has no scan
+  at this desk.
+
+Scans are filtered by station *before* the latest is chosen, so a later scan at
+another station never displaces this desk's evidence. Prior flight legs are
+never delivered; only the next flight is used for scope and content.
+
+### Storage and durability
+
+- The sender keeps `<archive>/handoff-sender.json`: every stream's desk,
+  confirmed cutoff, next packet number, the one packet awaiting
+  acknowledgement, and the identity of every confirmed packet.
+- A receiver keeps `<inbox>/handoff-inbox.json`: its stream/desk, the applied
+  packet number, the confirmed cutoff, the effective row copy, and every
+  applied packet's identity and receipt.
+- Both documents are replaced atomically (temp file, fsync, `os.replace`), so a
+  reader always sees the old or the new state and an interrupted write leaves
+  the previous accepted state readable.
+- The sender reads and writes its document under the archive-wide advisory
+  lock; the receiver serialises imports on `<inbox>/.handoff.lock`. Both are OS
+  advisory locks, so ordering holds across processes and after a restart.
+- The archive's `events.jsonl` is never modified. Projections use the existing
+  `archive._project` rules, so every packet binds to reproducible archive
+  versions.
+
+### Packet format
+
+```json
+{
+  "format": "bag-reconcile-handoff/v1",
+  "stream_id": "STREAM-BBB",
+  "desk": "BBB",
+  "packet_no": 1,
+  "prev_packet_no": 0,
+  "from_seq": 0,
+  "to_seq": 1,
+  "changes": [
+    {"bag_id": "B", "next_flight_id": "F2", "origin": "BBB",
+     "destination": "CCC", "departure": "2026-01-01T12:00:00+00:00",
+     "arrival": "2026-01-01T13:00:00+00:00", "flight_knowledge_seq": 1,
+     "latest_scan": {"scan_id": "S-BBB",
+                     "event_time": "2026-01-01T11:10:00+00:00",
+                     "knowledge_seq": 1}}
+  ],
+  "retractions": ["B"],
+  "integrity": {"algorithm": "sha256", "value": "<64 lowercase hex>"}
+}
+```
+
+- `packet_no` starts at 1 and is contiguous per stream. `prev_packet_no` is the
+  previous packet's number (0 for the first).
+- `from_seq` is the stream's confirmed cutoff the packet builds on; `to_seq` is
+  the new cutoff. Both are accepted archive `knowledge_seq` values and
+  `to_seq > from_seq`.
+- `changes` holds the full replacement row for every bag newly in scope or whose
+  any delivered field differs from the confirmed cutoff. `retractions` lists the
+  `bag_id`s that were delivered before but are no longer in scope; it carries no
+  new destination. A row still in scope whose scan was withdrawn stays in
+  `changes` with the updated (possibly `null`) `latest_scan`; it is never
+  retracted. Unchanged rows are not resent, so a packet with no changes and no
+  retractions is valid and proves the desk has reached `to_seq`.
+- `integrity.value` is the lowercase SHA-256 of the UTF-8 encoding of
+  `json.dumps(body, sort_keys=True, separators=(",", ":"))`, where `body` is the
+  whole packet without the `integrity` field. It is a plain integrity check an
+  offline receiver can recompute; it is not a signature.
+
+Scope is a **net** comparison between two cutoffs: packets may skip intermediate
+archive sequences, and only the state at `from_seq` versus `to_seq` matters.
+
+### Sender commands
+
+- `handoff-open --archive ARCHIVE --stream ID --desk STATION` — registers one
+  sender stream beside an existing archive. The `stream_id` must be new; the
+  station is fixed for its lifetime. Prints the registration.
+- `handoff-export --archive ARCHIVE --stream ID --as-of SEQ --output PACKET` —
+  exports the next packet, or re-exports the one awaiting acknowledgement.
+  - `SEQ` must be an accepted archive sequence strictly greater than the
+    confirmed cutoff.
+  - If a packet is awaiting acknowledgement, only its cutoff may be exported;
+    any other cutoff is refused. Re-exporting to a new path yields byte-identical
+    content.
+  - An existing `PACKET` path is never overwritten. The packet is written and
+    fsynced to a temporary file and atomically linked into place, so a failed or
+    interrupted export leaves no half packet. The pending packet is recorded
+    durably **before** the file becomes visible, so a restart still knows it is
+    awaiting a receipt; if publishing fails before anything is visible, the
+    pending record is rolled back and no cutoff or number advances.
+  - At most one packet per stream awaits acknowledgement at a time. Other
+    streams and the archive itself keep advancing.
+- `handoff-ack --archive ARCHIVE --stream ID --receipt RECEIPT` — advances a
+  stream only on a receipt that exactly matches its pending packet (stream, desk,
+  packet number, both cutoffs, and the packet's content digest). A receipt for a
+  different stream, different content, or a packet never sent is refused and the
+  position is unchanged. A genuine receipt for an already-confirmed packet is
+  accepted but never advances or rolls back the stream, even if a later packet is
+  already pending. Prints the confirmed cutoff and whether it advanced.
+
+### Receiver commands
+
+- `handoff-inbox --inbox INBOX --stream ID --desk STATION` — creates an empty
+  receiver for exactly one stream, without needing the source archive. `INBOX`
+  must not already exist. An empty inbox reports packet number and cutoff 0.
+- `handoff-import --inbox INBOX --packet PACKET` — validates and applies one
+  packet, printing the receipt to stdout for the operator to pass back. The
+  receipt is:
+
+  ```json
+  {"format": "bag-reconcile-handoff-receipt/v1", "stream_id": "...",
+   "desk": "...", "packet_no": 1, "from_seq": 0, "to_seq": 1,
+   "packet_sha256": "<64 lowercase hex>"}
+  ```
+
+  Validation order:
+
+  1. Packet identity and format: exact field set, `format`, ids, integer
+     ranges, `to_seq > from_seq`, and every row's `origin` equals the desk.
+  2. Integrity: the recomputed SHA-256 must equal `integrity.value`.
+  3. Stream/desk match against this inbox.
+  4. Retry rule (before the continuation check): if `packet_no` was already
+     applied, return its first receipt when the content digest matches, or
+     reject when the number was applied with different content. This never
+     re-applies and never rewinds the copy.
+  5. Continuation: `packet_no` must equal the current number + 1,
+     `prev_packet_no` must equal the current number, and `from_seq` must equal
+     the inbox's confirmed cutoff. A skipped/out-of-order number, a wrong base,
+     or a mismatched `prev_packet_no` rejects the whole packet.
+  6. Content: no duplicate `bag_id` within `changes` or `retractions`, and every
+     retraction must name a row the inbox currently holds.
+
+  A rejected packet leaves the copy unchanged. An accepted packet updates the
+  row copy, the cutoff, and the resendable receipt in a single atomic write.
+- `handoff-view --inbox INBOX` — prints the effective packet number, confirmed
+  cutoff, and all of this desk's rows, sorted by `bag_id`. An empty inbox reports
+  `packet_no` 0, `confirmed_seq` 0, and no rows.
+
+### Recovery after restart or failure
+
+Every command re-reads its state from disk, so closing and relaunching the
+program loses nothing.
+
+- **Export failed or was interrupted.** If no packet became visible, nothing
+  was consumed: export the same or another cutoff normally. If the packet did
+  become visible, it is remembered as pending; re-export the same cutoff (bytes
+  unchanged) or wait for its receipt.
+- **Sender restarted while a packet is pending.** The pending packet is still
+  recorded; re-export its cutoff or apply the matching receipt.
+- **Receiver applied a packet but the receipt was lost.** Re-import the same
+  packet (from either the original or a re-exported copy); it returns the first
+  receipt without re-applying.
+- **Receiver update failed.** The previous accepted copy remains readable; the
+  same packet can be imported again and applied once.
+- **Sender lost a confirmation but the receiver has applied it.** The sender
+  stays at its old cutoff until it receives the receipt. If the packet is still
+  pending, re-send the same cutoff. If multiple older packets exist, each
+  re-import still returns its own first receipt.
+
+### Errors
+
+All six commands exit with status 2 and print `bag-reconcile: <message>` on
+validation, JSON, duplicate-key, or filesystem errors. No command contacts an
+external service; everything uses the standard library.

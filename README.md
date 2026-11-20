@@ -66,3 +66,30 @@ All loading commands share one archive-wide lock with `archive-apply`, so scan/
 flight reads never mix with a half-written occupancy update and concurrent
 commits of intersecting manifests are serialised. See `docs/contract.md` for the
 formats, reasons, and invariants.
+
+## Offline desk handoff
+
+Handoff delivers one desk's evidence to a receiver that never reads the source
+archive, through plain JSON files moved by hand. Each sender stream is a fixed
+`stream_id` + station `desk`; a receiver inbox carries exactly one stream. A
+packet carries only bags whose next flight departs from the desk, with that
+desk's latest scan (never another station's scans, earlier legs, screening
+records, or manifests), as the net change since the last confirmed cutoff.
+
+```sh
+bag-reconcile handoff-open   --archive ARCHIVE --stream ID --desk STATION
+bag-reconcile handoff-export --archive ARCHIVE --stream ID --as-of SEQ --output PACKET
+bag-reconcile handoff-inbox  --inbox INBOX --stream ID --desk STATION
+bag-reconcile handoff-import --inbox INBOX --packet PACKET   # prints a receipt
+bag-reconcile handoff-ack    --archive ARCHIVE --stream ID --receipt RECEIPT
+bag-reconcile handoff-view   --inbox INBOX
+```
+
+Packets are numbered per stream from 1, carry `from_seq`/`to_seq` cutoffs,
+full replacement rows, retraction-only entries, and a SHA-256 integrity value.
+Exactly one packet per stream awaits acknowledgement; an already-applied packet
+re-imports to its first receipt without rewinding, and a sender advances only on
+a receipt that exactly matches a sent packet. State is written atomically, so
+every side can be closed and relaunched without losing a pending packet, an
+applied copy, or a receipt. See `docs/contract.md` for the file formats,
+validation order, and restart recovery steps.
