@@ -7,15 +7,38 @@ Failed batches are validated before any write, so the log stays byte-for-byte
 unchanged and no sequence number is consumed.
 """
 
+import fcntl
 import json
 import os
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 from .core import _time, reconcile
 
 EVENTS_FILE = "events.jsonl"
 INITIAL_SEQ = 1
+LOCK_FILE = ".bag-reconcile.lock"
+
+
+@contextmanager
+def _locked(archive_path):
+    """Hold the archive-wide advisory lock for a consistent read/modify/write.
+
+    Every archive mutation (``archive-apply``) and every loading-workbench
+    command takes the same exclusive lock, so a scan/flight read can never be
+    interleaved with a half-written occupancy update.  The lock lives beside
+    the event log and is an implementation detail, not part of the log.
+    """
+    path = Path(archive_path)
+    if not (path / EVENTS_FILE).is_file():
+        raise ValueError(f"not a bag-reconcile archive: {archive_path}")
+    with (path / LOCK_FILE).open("a+") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _pairs(items):
@@ -122,6 +145,9 @@ def init_archive(input_path, archive_path):
         (staging / EVENTS_FILE).write_text(
             json.dumps(event, separators=(",", ":")) + "\n", encoding="utf-8"
         )
+        # The lock file is created inside the staging directory so it moves
+        # into place atomically with the events log.
+        (staging / LOCK_FILE).write_text("", encoding="utf-8")
         os.replace(staging, archive)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -254,25 +280,26 @@ def _validate_batch(batch, state):
 
 def apply_batch(archive_path, batch_path):
     """Validate and append one batch; returns the assigned knowledge_seq."""
-    events = _load_events(archive_path)
-    batch = _load_json(batch_path)
-    state = _current_state(events)
-    # Everything is validated before the archive file is opened for writing.
-    batch_id, scan_changes, flight_changes = _validate_batch(batch, state)
-    seq = events[-1]["knowledge_seq"] + 1
-    event = {
-        "event": "batch",
-        "knowledge_seq": seq,
-        "batch_id": batch_id,
-        "scans": scan_changes,
-        "flights": flight_changes,
-    }
-    events_file = Path(archive_path) / EVENTS_FILE
-    with events_file.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(event, separators=(",", ":")) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    return seq, batch_id
+    with _locked(archive_path):
+        events = _load_events(archive_path)
+        batch = _load_json(batch_path)
+        state = _current_state(events)
+        # Everything is validated before the archive file is opened for writing.
+        batch_id, scan_changes, flight_changes = _validate_batch(batch, state)
+        seq = events[-1]["knowledge_seq"] + 1
+        event = {
+            "event": "batch",
+            "knowledge_seq": seq,
+            "batch_id": batch_id,
+            "scans": scan_changes,
+            "flights": flight_changes,
+        }
+        events_file = Path(archive_path) / EVENTS_FILE
+        with events_file.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return seq, batch_id
 
 
 def _project(events, as_of):
@@ -309,6 +336,11 @@ def _project(events, as_of):
 
 
 def build_report(archive_path, as_of):
+    with _locked(archive_path):
+        return _build_report_locked(archive_path, as_of)
+
+
+def _build_report_locked(archive_path, as_of):
     events = _load_events(archive_path)
     max_seq = events[-1]["knowledge_seq"]
     if not isinstance(as_of, int) or isinstance(as_of, bool) or as_of < 1 or as_of > max_seq:

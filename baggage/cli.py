@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import archive
+from . import archive, loading
 from .core import reconcile
 
 
@@ -12,6 +12,14 @@ def _pairs(items):
 
 
 ARCHIVE_COMMANDS = ("archive-init", "archive-apply", "archive-report")
+LOADING_COMMANDS = (
+    "loading-init",
+    "screening-apply",
+    "loading-review",
+    "loading-commit",
+    "loading-cancel",
+    "loading-status",
+)
 
 
 def _main_legacy(argv):
@@ -52,6 +60,35 @@ def _main_archive(command, argv):
         print(json.dumps(report["summary"], sort_keys=True))
 
 
+def _main_loading(command, argv):
+    parser = argparse.ArgumentParser(prog=f"bag-reconcile {command}")
+    parser.add_argument("--archive", required=True)
+    if command == "loading-init":
+        args = parser.parse_args(argv)
+        result = loading.init_workbench(args.archive)
+    elif command == "screening-apply":
+        parser.add_argument("--batch", required=True)
+        args = parser.parse_args(argv)
+        result = loading.apply_screening(args.archive, args.batch)
+    elif command == "loading-review":
+        parser.add_argument("--request", required=True)
+        args = parser.parse_args(argv)
+        result = loading.review_manifest(args.archive, args.request)
+    elif command == "loading-commit":
+        parser.add_argument("--review", required=True)
+        args = parser.parse_args(argv)
+        result = loading.commit_review(args.archive, args.review)
+    elif command == "loading-cancel":
+        parser.add_argument("--manifest", required=True)
+        args = parser.parse_args(argv)
+        result = loading.cancel_manifest(args.archive, args.manifest)
+    else:
+        parser.add_argument("--manifest", required=True)
+        args = parser.parse_args(argv)
+        result = loading.manifest_status(args.archive, args.manifest)
+    print(json.dumps(result, sort_keys=True))
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -60,6 +97,8 @@ def main(argv=None):
     try:
         if command in ARCHIVE_COMMANDS:
             _main_archive(command, argv[1:])
+        elif command in LOADING_COMMANDS:
+            _main_loading(command, argv[1:])
         else:
             _main_legacy(argv)
     except (OSError, ValueError, KeyError, TypeError) as exc:

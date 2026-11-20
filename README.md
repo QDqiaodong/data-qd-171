@@ -29,3 +29,40 @@ bag-reconcile archive-report --archive ARCHIVE --as-of SEQ --output OUTPUT
 - `archive-report` runs the unchanged reconcile rules against the state known at `as-of`, binds the result to that sequence, and lists each active scan and flight with the `knowledge_seq` and `batch_id` where its version last took effect. Unknown sequences error out and never create the output file; existing outputs are never overwritten.
 
 See `docs/contract.md` for the event-log and report layouts and the full validation rules.
+
+## Local loading-release workbench
+
+The workbench reconciles manually declared screening credentials with a requested
+load manifest and registers an operator-confirmed manifest as an exclusive
+release record. It lives inside an existing archive, never rewrites
+`events.jsonl`, and needs no archive rebuild. It reports declared evidence only:
+it never infers physical bag location, dispatches staff, or calls an external
+service, and it does not treat `connection_at_risk` as a screening result.
+
+```sh
+bag-reconcile loading-init    --archive ARCHIVE
+bag-reconcile screening-apply --archive ARCHIVE --batch BATCH
+bag-reconcile loading-review  --archive ARCHIVE --request REQUEST
+bag-reconcile loading-commit  --archive ARCHIVE --review REVIEW_ID
+bag-reconcile loading-cancel  --archive ARCHIVE --manifest MANIFEST_ID
+bag-reconcile loading-status  --archive ARCHIVE --manifest MANIFEST_ID
+```
+
+- `loading-init` creates the single workbench file `loading-workbench.json`
+  inside a valid, existing archive.
+- `screening-apply` accepts a whole batch of manual `record`/`revoke`
+  operations or none; credentials bind to a bag's latest scan identity and
+  source `knowledge_seq`, and `batch_id`/`clearance.id` are never reused.
+- `loading-review` saves an immutable review (occupying nothing) with
+  per-bag eligibility, reasons, occupiers, and the source versions used.
+- `loading-commit` atomically registers the whole manifest and claims its bags,
+  re-verifying that the review's relevant evidence is unchanged. Retries of the
+  same review return the original receipt.
+- `loading-cancel` releases all claims; repeated cancels are no-ops.
+- `loading-status` reports `active`, `suspended`, or `cancelled` from current
+  evidence while keeping the original basis separate.
+
+All loading commands share one archive-wide lock with `archive-apply`, so scan/
+flight reads never mix with a half-written occupancy update and concurrent
+commits of intersecting manifests are serialised. See `docs/contract.md` for the
+formats, reasons, and invariants.
