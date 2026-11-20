@@ -1,0 +1,34 @@
+name: QD171 Q6 x64 scale evidence
+on:
+  push:
+    branches: [codex/qd171-q006-x64-verification]
+permissions:
+  contents: read
+jobs:
+  scale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Verify frozen artifact and run offline
+        shell: bash
+        env:
+          FROZEN_ARTIFACT: 81daa96072a86e3b0571b8fa893e202e6491ac33
+          FROZEN_TEST_SHA: 7192b95aea322bb466a86225444b62d6b128142637bd5c899a2ca6f023b8816c
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf -- "$tmp"' EXIT
+          git init -q "$tmp/git"
+          git -C "$tmp/git" fetch --quiet --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git -C "$tmp/git" cat-file -e "$FROZEN_ARTIFACT^{commit}"
+          test "$(git -C "$tmp/git" rev-parse "$GITHUB_SHA^")" = "$FROZEN_ARTIFACT"
+          mkdir "$tmp/frozen"
+          git -C "$tmp/git" archive "$FROZEN_ARTIFACT" | tar -x -C "$tmp/frozen"
+          git -C "$tmp/git" show "$GITHUB_SHA:.github/verification/qd171-q006-scale.py" > "$tmp/verify.py"
+          printf '%s  %s\n' "$FROZEN_TEST_SHA" "$tmp/verify.py" | sha256sum --check
+          test "$(uname -m)" = x86_64
+          test "$RUNNER_ARCH" = X64
+          lscpu
+          printf 'FROZEN_ARTIFACT=%s TEST_SHA=%s RUNNER_ARCH=%s RUN_ID=%s\n' "$FROZEN_ARTIFACT" "$FROZEN_TEST_SHA" "$RUNNER_ARCH" "$GITHUB_RUN_ID"
+          cd "$tmp/frozen"
+          sudo unshare --net --setgid "$(id -g)" --setuid "$(id -u)" -- env -i PATH=/usr/bin:/bin CI=true python3 -B "$tmp/verify.py"
