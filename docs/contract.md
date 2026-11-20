@@ -697,3 +697,193 @@ A retried write after an ambiguous failure either has already advanced the
 ledger (then it is a no-op at the same cutoff) or had not written at all (then it
 posts the same lines once). Neither case double-charges, and no step ever
 requires editing `events.jsonl`.
+
+## Local sample-release workspace and contamination tracking
+
+The study workspace publishes named, frozen *sample releases* built from manual
+`success`/`failure` labels and manually declared anomaly links, and then tells a
+consumer — at any of its own revisions — which released rows remain usable and
+which must be withdrawn. It is an offline bookkeeping tool: it treats neither the
+archive's verification nor a published row as ground truth, never trains a model,
+never contacts an external service, and never drives scheduling or loading.
+
+It lives **beside** an existing archive in one JSON document,
+`<archive>/study-workbench.json`, created by `study-init`. `events.jsonl` is never
+rewritten, and the existing reconcile, archive, loading, handoff and fee commands
+are unchanged. Every study command, and `archive-apply`, takes the same
+archive-wide advisory lock, so a study decision never mixes with a half-written
+archive or study update.
+
+### Identities and revisions
+
+- A `bag_id` is the sample identity. Relabelling, re-releasing, and later
+  archive scan corrections never change it.
+- `study_rev` is the workspace's own revision counter. It starts at 0 and
+  increases by exactly 1 for each **successfully accepted** new input batch or
+  new publication. It has no conversion to `knowledge_seq`; a single archive
+  batch or a single `study-apply` is one revision step regardless of how many
+  operations it carries.
+- Each accepted label version, link event, and release records the `study_rev`
+  and `batch_id`/`release_id` that created it; those historical facts are never
+  rewritten.
+
+### `study-init --archive ARCHIVE`
+
+Creates the single workspace for an existing, valid archive. Repeating it, or
+initialising beside a non-archive, is an error and creates nothing. Prints
+`{"archive", "workbench", "study_rev": 0}`.
+
+### `study-apply --archive ARCHIVE --batch FILE`
+
+Accepts one batch of manual labels and event links. Format:
+
+```json
+{"batch_id": "STUDY-1",
+ "labels": [{"bag_id": "A", "result": "success", "features_as_of": 1}],
+ "links": [{"op": "link", "bags": ["A", "B"]},
+           {"op": "unlink", "bags": ["B", "C"]}]}
+```
+
+`labels` and `links` may each be omitted (treated as empty), but at least one
+must be non-empty. The whole batch is validated before anything is written;
+a failure leaves the workspace byte-for-byte unchanged and consumes no revision.
+
+Label operations:
+
+- `{"bag_id": "…", "result": "success" | "failure", "features_as_of": N}`
+  registers or corrects that bag's label. `bag_id` must exist in the archive;
+  `result` is exactly `success` or `failure`; `features_as_of` is an integer
+  `knowledge_seq` the archive has accepted (1 … latest). It points at the archive
+  version whose verification features the label is understood against.
+- `{"bag_id": "…", "result": null}` retracts the bag's label and is rejected
+  when the bag has no currently valid label. A retraction carries no feature
+  cutoff.
+- A bag appears at most once in a batch. Giving the same value again is still a
+  new label version, sourced from this batch's revision and batch id.
+
+Link operations use `{"op": "link" | "unlink", "bags": ["A", "B"]}` to add or
+remove an undirected relation. The two endpoints must differ and both exist in
+the archive; the same unordered pair appears at most once per batch. Linking an
+existing relation or unlinking a missing one is an error. Cycles are legal, and
+two bags that can reach each other through current links are one anomaly group.
+Bags without labels may still be linked and are never dropped from a group
+before it is published. A new link is recorded truthfully even when it reveals
+past contamination.
+
+`batch_id` must be a non-empty string, unique for the workspace lifetime
+(rejected even with an identical payload). All label, link, and batch-id checks
+must pass for the whole batch to be accepted. Prints the accepted batch, the new
+`study_rev`, and the archive `knowledge_seq` used.
+
+### `study-publish --archive ARCHIVE --request FILE`
+
+Publishes one named release. Format:
+
+```json
+{"release_id": "REL-1",
+ "rows": [{"bag_id": "A", "partition": "train"},
+          {"bag_id": "B", "partition": "eval"}]}
+```
+
+`rows` must be non-empty, must not repeat a `bag_id`, must name archive bags,
+and each `partition` is exactly `train` or `eval`. Every listed bag must have a
+currently valid label. A retry of the **same** `release_id` with the same set of
+`(bag_id, partition)` rows (row order irrelevant) returns the **first** frozen
+release, even if its content must since be withdrawn. Reusing a `release_id` with
+different rows is rejected. A `release_id` that was rejected and never succeeded
+may be reused after the inputs are corrected.
+
+Partition rules, checked against one consistent snapshot taken before the
+operation (so list order never matters):
+
+- Every anomaly group a release touches is evaluated as a whole.
+- Exposure is recorded only on bags that were actually published. A group with
+  no prior exposure may go to either partition.
+- A group exposed only to `train` may only be released to `train`, and likewise
+  only to `eval` if exposed only to `eval`.
+- A group already exposed to **both** partitions may not be released again.
+- Within one release, no group may be split across `train` and `eval`.
+
+Violating any rule rejects the whole release; no row is published and no
+revision is consumed. On success the frozen release is printed and the revision
+advances by 1.
+
+Each frozen row records the bag identity, partition, and the manual label with
+its result, `features_as_of`, source `study_rev`, and source `batch_id`. It also
+freezes, **at the label's own `features_as_of` archive version**, the bag's
+`status`, `last_scan`, and `connection_at_risk` from the existing reconcile
+rules, plus the source versions of:
+
+- the latest scan (if any) — its `scan_id`, `knowledge_seq`, and `batch_id`;
+- the bag's current leg and its next leg (if any) — each flight's
+  `knowledge_seq` and `batch_id`.
+
+Initial versions report `batch_id: null`. Different rows on one release may pin
+different archive cutoffs; a feature is never taken from a later archive
+version, and the manual label is never used as a feature. The frozen content is
+immutable and is never rebuilt from current evidence.
+
+### `study-view --archive ARCHIVE [--release ID] [--as-of REV]`
+
+Shows a consumer the availability of released rows. With `--as-of` omitted it
+uses the current `study_rev`; with it, only labels, links, actual releases, and
+exposure records that existed at or before that revision are considered.
+Revision 0 is queryable and returns an empty release list. An unknown (or future)
+revision is an error, and `--release ID` errors when that release did not exist
+at the requested revision. Without `--release`, every release existing at the
+revision is shown.
+
+Output always names the `study_rev` actually used (and the current one), and
+keeps frozen content separate from availability. Per release it prints
+`published_study_rev`, the frozen `release`, and availability checked at the
+requested revision with one conclusion per row:
+
+- `usable` is true only when the group is not exposed to both partitions **and**
+  the row's frozen label version is still current.
+- `withdrawn_reasons` lists `group_exposure_conflict` and/or
+  `label_version_changed`; when both hold, both are reported.
+- `label` shows the frozen version and the current version side by side.
+- `group` lists the component's bags and its real exposure records
+  (`bag_id`, `partition`, `release_id`, `study_rev`); exposure is attached to
+  bags actually published, never copied to an unreleased neighbour.
+- `evidence` (present when contaminated) gives at least one re-checkable
+  justification: one real exposure from each partition, and, for each, a chain
+  of links still valid at that revision from the checked bag to that exposure's
+  bag (empty when the bag is the exposure itself). Each edge carries its source
+  `study_rev` and `batch_id`. When several explanations exist, one is chosen
+  deterministically and is stable for the same revision.
+
+Withdrawing a wrong link is followed by recomputing groups from the remaining
+links; a second path keeps the conflict until it too is removed. Retracting a
+label, a stale frozen row, or a later relabel never erases a real exposure.
+Historical releases and historical availability are never overwritten by later
+corrections, so a relabelled bag needs a **new** release to be usable as
+released data; the old release does not silently turn into new data.
+
+### Durability, atomicity, and errors
+
+The workspace is replaced atomically (temp file, fsync, `os.replace`) under the
+archive-wide lock. A write failure leaves the previous accepted state intact. It
+is impossible to persist half a batch, a label/link without its revision bump, or
+an exposure without its release. If a publish succeeded but the caller lost the
+output, re-running the identical request returns the already-frozen release.
+
+All four commands exit with status 2 and print `bag-reconcile: <message>` on
+validation, JSON, duplicate-key, invalid-type, unknown-reference, or unknown
+revision errors, matching the existing CLI convention. IDs are non-empty strings.
+
+### Worked acceptance sequence
+
+Labels A and C exist. Publish A to `train` and C to `eval`. Late links A–B and
+B–C arrive (B has no label); both old releases now report
+`group_exposure_conflict` with evidence naming the A/`train` and C/`eval`
+exposures and a link chain to each, and any other labelled bag attached to A or C
+cannot be published. Adding A–C and then removing only B–C does not clear the
+conflict; after also removing A–C the two groups return to their original
+partitions. Retracting and refilling A's label makes the old A row unusable for
+`label_version_changed` while A's `train` exposure still bars its group from
+`eval`. Old revisions still show the earlier (uncontaminated) state; a retry of
+an old release replays its frozen content; splitting one group across partitions
+in a single release is rejected as a whole; rows frozen at different archive
+cutoffs keep their correct per-row sources; and any rejected operation leaves the
+revision and the stored state untouched.

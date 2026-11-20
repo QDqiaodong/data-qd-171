@@ -67,6 +67,43 @@ flight reads never mix with a half-written occupancy update and concurrent
 commits of intersecting manifests are serialised. See `docs/contract.md` for the
 formats, reasons, and invariants.
 
+## Local sample-release workspace and contamination tracking
+
+The study workspace sits beside an existing archive and publishes named, frozen
+sample releases built from manual `success`/`failure` labels and declared
+anomaly links. It then reports, for any of its own revisions, which released
+rows remain usable and which must be withdrawn — with re-checkable evidence.
+It is offline bookkeeping only: it never treats archive verification as truth,
+never trains a model, and never drives scheduling or loading. `events.jsonl` is
+never modified.
+
+```sh
+bag-reconcile study-init    --archive ARCHIVE
+bag-reconcile study-apply   --archive ARCHIVE --batch FILE
+bag-reconcile study-publish --archive ARCHIVE --request FILE
+bag-reconcile study-view    --archive ARCHIVE [--release ID] [--as-of REV]
+```
+
+- A `bag_id` is a stable sample identity; the workspace keeps its own
+  `study_rev`, starting at 0 and advancing by 1 per accepted batch or publish.
+- `study-apply` takes manual labels (`success`/`failure`/`null` retraction, each
+  pinned to an accepted `features_as_of`) and undirected `link`/`unlink`
+  relations; connected bags form one anomaly group. The whole batch is accepted
+  or rejected; batch ids are never reused.
+- `study-publish` freezes each row's identity, partition, label version, and the
+  archive's `status`/`last_scan`/`connection_at_risk` plus scan and flight source
+  versions at that label's cutoff. It refuses to split or re-expose a group:
+  never-exposed groups pick any partition, a group already in one partition may
+  only repeat it, and a group in both may not be released. Replaying the same
+  request returns the first frozen release.
+- `study-view` reports usable/withdrawn rows and reasons (`label_version_changed`,
+  `group_exposure_conflict`) with, when contaminated, each side's real exposure
+  and a link chain to it. Historical revisions and frozen releases are never
+  rewritten.
+
+See `docs/contract.md` for the full formats, partition rules, and evidence
+layout.
+
 ## Offline desk handoff
 
 Handoff delivers one desk's evidence to a receiver that never reads the source

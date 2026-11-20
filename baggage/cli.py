@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import archive, fees, handoff, loading
+from . import archive, fees, handoff, loading, study
 from .core import reconcile
 
 
@@ -34,6 +34,12 @@ FEE_COMMANDS = (
     "fee-close",
     "fee-correct",
     "fee-show",
+)
+STUDY_COMMANDS = (
+    "study-init",
+    "study-apply",
+    "study-publish",
+    "study-view",
 )
 
 
@@ -173,6 +179,28 @@ def _main_fee(command, argv):
     print(json.dumps(result, sort_keys=True))
 
 
+def _main_study(command, argv):
+    parser = argparse.ArgumentParser(prog=f"bag-reconcile {command}")
+    parser.add_argument("--archive", required=True)
+    if command == "study-init":
+        args = parser.parse_args(argv)
+        result = study.init_study(args.archive)
+    elif command == "study-apply":
+        parser.add_argument("--batch", required=True)
+        args = parser.parse_args(argv)
+        result = study.apply_study(args.archive, args.batch)
+    elif command == "study-publish":
+        parser.add_argument("--request", required=True)
+        args = parser.parse_args(argv)
+        result = study.publish_release(args.archive, args.request)
+    else:
+        parser.add_argument("--release")
+        parser.add_argument("--as-of", type=int)
+        args = parser.parse_args(argv)
+        result = study.view_study(args.archive, args.release, args.as_of)
+    print(json.dumps(result, sort_keys=True))
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -187,6 +215,8 @@ def main(argv=None):
             _main_handoff(command, argv[1:])
         elif command in FEE_COMMANDS:
             _main_fee(command, argv[1:])
+        elif command in STUDY_COMMANDS:
+            _main_study(command, argv[1:])
         else:
             _main_legacy(argv)
     except (OSError, ValueError, KeyError, TypeError) as exc:
