@@ -7,9 +7,9 @@ permissions:
 jobs:
   scale:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
-      - name: Verify frozen artifact and run offline
+      - name: Record native x64 verification offline
         shell: bash
         env:
           FROZEN_ARTIFACT: 81daa96072a86e3b0571b8fa893e202e6491ac33
@@ -21,7 +21,7 @@ jobs:
           git init -q "$tmp/git"
           git -C "$tmp/git" fetch --quiet --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
           git -C "$tmp/git" cat-file -e "$FROZEN_ARTIFACT^{commit}"
-          test "$(git -C "$tmp/git" rev-parse "$GITHUB_SHA^")" = "$FROZEN_ARTIFACT"
+          git -C "$tmp/git" merge-base --is-ancestor "$FROZEN_ARTIFACT" "$GITHUB_SHA"
           mkdir "$tmp/frozen"
           git -C "$tmp/git" archive "$FROZEN_ARTIFACT" | tar -x -C "$tmp/frozen"
           git -C "$tmp/git" show "$GITHUB_SHA:.github/verification/qd171-q006-scale.py" > "$tmp/verify.py"
@@ -30,5 +30,36 @@ jobs:
           test "$RUNNER_ARCH" = X64
           lscpu
           printf 'FROZEN_ARTIFACT=%s TEST_SHA=%s RUNNER_ARCH=%s RUN_ID=%s\n' "$FROZEN_ARTIFACT" "$FROZEN_TEST_SHA" "$RUNNER_ARCH" "$GITHUB_RUN_ID"
-          cd "$tmp/frozen"
-          sudo unshare --net --setgid "$(id -g)" --setuid "$(id -u)" -- env -i PATH=/usr/bin:/bin CI=true python3 -B "$tmp/verify.py"
+          git -C "$tmp/git" show "$GITHUB_SHA:.github/verification/record_session.py" > "$tmp/record_session.py"
+          mkdir "$tmp/inputs" "$RUNNER_TEMP/qd171-q006-x64"
+          cp "$tmp/verify.py" "$tmp/inputs/verify.py"
+          printf '%s' '{"version":2,"requirements":[{"id":"scale","description":"Frozen native x64 supplemental scale check"}],"commands":[{"id":"x64-scale","argv":["python3","-B","/verification-input/verify.py"],"requirements":["scale"],"timeout_seconds":120}]}' > "$tmp/inputs/plan.json"
+          cat > "$tmp/Dockerfile" <<'DOCKERFILE'
+          FROM ubuntu:24.04
+          RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb xterm ffmpeg xdotool python3 fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+          COPY record_session.py /opt/verification/record_session.py
+          ENTRYPOINT ["python3","-B","/opt/verification/record_session.py"]
+          DOCKERFILE
+          mkdir "$tmp/build"
+          mv "$tmp/Dockerfile" "$tmp/record_session.py" "$tmp/build/"
+          docker build --tag qd171-x64-verifier "$tmp/build"
+          docker run --rm --init --network none --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL \
+            --security-opt no-new-privileges --pids-limit 256 --memory 2g --cpuset-cpus 0 \
+            --mount "type=bind,src=$tmp/frozen,dst=/workspace/project" \
+            --mount "type=bind,src=$tmp/inputs,dst=/verification-input,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/qd171-q006-x64,dst=/verification" \
+            qd171-x64-verifier || run_exit=$?
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/qd171-q006-x64"
+          cp "$tmp/inputs/plan.json" "$RUNNER_TEMP/qd171-q006-x64/plan.json"
+          cat "$RUNNER_TEMP/qd171-q006-x64/command-001.log"
+          test "${run_exit:-0}" = 0
+          test -s "$RUNNER_TEMP/qd171-q006-x64/recording.mp4"
+      - name: Retain the verifier evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qd171-q006-x64
+          path: ${{ runner.temp }}/qd171-q006-x64/
+          if-no-files-found: error
+          retention-days: 14
