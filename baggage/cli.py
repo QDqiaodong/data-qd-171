@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import archive, fees, handoff, loading, study
+from . import archive, fees, handoff, loading, readaudit, study
 from .core import reconcile
 
 
@@ -41,6 +41,7 @@ STUDY_COMMANDS = (
     "study-publish",
     "study-view",
 )
+READ_AUDIT_COMMANDS = ("read-audit",)
 
 
 def _main_legacy(argv):
@@ -201,6 +202,20 @@ def _main_study(command, argv):
     print(json.dumps(result, sort_keys=True))
 
 
+def _main_read_audit(command, argv):
+    parser = argparse.ArgumentParser(prog=f"bag-reconcile {command}")
+    parser.add_argument("--archive", required=True)
+    parser.add_argument("--as-of", required=True, type=int)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--decisions")
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args(argv)
+    report = readaudit.write_report(
+        args.archive, args.as_of, args.input, args.output, args.decisions
+    )
+    print(json.dumps(report["summary"], sort_keys=True))
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -217,6 +232,8 @@ def main(argv=None):
             _main_fee(command, argv[1:])
         elif command in STUDY_COMMANDS:
             _main_study(command, argv[1:])
+        elif command in READ_AUDIT_COMMANDS:
+            _main_read_audit(command, argv[1:])
         else:
             _main_legacy(argv)
     except (OSError, ValueError, KeyError, TypeError) as exc:

@@ -169,3 +169,34 @@ same station, month, and amount add nothing. Write cutoffs must be accepted and
 never older than the last processed one. The ledger is written atomically and
 re-read on every command, so a failed or interrupted run posts nothing and can
 be retried exactly once. See `docs/contract.md` for the full rules.
+
+## Local read-audit reconciliation
+
+`read-audit` reconciles one station's imperfect barcode reads with the bags that
+must be checked for a chosen next leg, and reports how many bags can be given
+ownership evidence, which bags certainly lack evidence, and which reads still
+need a human to look at the original image. It is read-only, keeps no state, and
+never touches `events.jsonl`.
+
+```sh
+bag-reconcile read-audit --archive ARCHIVE --as-of SEQ --input BATCH \
+    [--decisions FILE] --output REPORT
+```
+
+- `BATCH` gives `station`, a half-open departure window, a half-open capture
+  window, and `reads` (`read_id`, `captured_at`, `candidate_bag_ids`). Only
+  offset-aware instants are compared; candidate ids that are unknown or out of
+  scope are kept verbatim but excluded from reconciliation.
+- The optional `--decisions` file carries human `confirm` (`read_id`, `bag_id`,
+  `proof_ref`) and `discard` (`read_id`, `proof_ref`) decisions. They are
+  binding and all-or-nothing: any conflict rejects the whole request.
+- The report gives `max_coverage`, `min_missing`, one example pairing, and — for
+  every checked bag and every in-window read — the conclusions that hold across
+  *all* maximum-coverage schemes (`certain_evidence` / `possible_missing` /
+  `certain_missing`, and `always_used` / `optional` / `unused`), while
+  distinguishing confirmed, discarded, and naturally unattributable reads.
+
+An existing output is never overwritten, and a failed run creates no file. See
+`docs/contract.md` for the exact formats and the full conclusion semantics. Use
+`tools/read_audit_load.py` and `tools/read_audit_bench.py` to reproduce the
+single-core load and measurement.
